@@ -1,0 +1,25 @@
+[project]
+name = "docsynth-ocr-worker"
+version = "0.1.0"
+description = "Worker Redis do DocSynth para converter PDFs em Markdown"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.35",
+    "openai>=1.0.0",
+    "ocr-extraction>=0.1.0",
+    "redis>=5.2",
+]
+
+[project.scripts]
+docsynth-ocr-worker = "docsynth_ocr_worker.worker:main"
+
+[tool.uv.sources]
+# ponytail: assumes OCR-Extraction stays a sibling checkout; update the relative path if the layout changes.
+ocr-extraction = { path = "../../../OCR-Extraction", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/docsynth_ocr_worker"]
