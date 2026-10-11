@@ -1,0 +1,1 @@
+"""DocSynth OCR background worker."""
