@@ -1,0 +1,72 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  USER
+  ADMIN
+
+  @@map("user_role")
+}
+
+enum DocumentType {
+  PUR
+  RDA
+
+  @@map("document_type")
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         UserRole @default(USER)
+  createdAt    DateTime @default(now()) @map("created_at")
+  documents    Document[]
+
+  @@map("users")
+}
+
+model Document {
+  id           String   @id @default(uuid()) @db.Uuid
+  objectKey    String   @unique @map("object_key")
+  originalName String   @map("original_name")
+  title        String?
+  description  String?  @db.Text
+  mimeType     String   @map("mime_type")
+  size         Int
+  ocrStatus    String   @default("QUEUED") @map("ocr_status")
+  markdownKey  String?  @map("markdown_key")
+  ocrError     String?  @db.Text @map("ocr_error")
+  type         DocumentType @default(PUR) @map("document_type")
+  userId       String?  @db.Uuid @map("user_id")
+  user         User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  topics       String[] @default([])
+  questions    String[] @default([])
+  summaryLevel String   @default("balanced") @map("summary_level")
+  summaries    DocumentSummary[]
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([userId, type])
+  @@map("documents")
+}
+
+model DocumentSummary {
+  id           String   @id @default(uuid()) @db.Uuid
+  documentId   String   @db.Uuid @map("document_id")
+  document     Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  content      String   @db.Text
+  topics       String[] @default([])
+  questions    String[] @default([])
+  summaryLevel String   @default("balanced") @map("summary_level")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([documentId, createdAt])
+  @@map("document_summaries")
+}
