@@ -1,8 +1,43 @@
 # DocSynth API
 
-Backend NestJS com PostgreSQL, Prisma e MinIO para armazenar PDFs.
+API NestJS e worker Python para receber PDFs PUR/RDA, extrair Markdown e gerar sínteses em tempo real com um servidor de modelos compatível com OpenAI, como o llama.cpp.
 
-## Desenvolvimento local
+## O que o projeto oferece
+
+- Cadastro e autenticação com token; documentos isolados por usuário.
+- Upload de PDF de até 20 MB, extração OCR em segundo plano e download do PDF ou Markdown.
+- Geração de sínteses por tópicos com resposta incremental via Server-Sent Events (SSE), progresso do processamento do prompt e cancelamento.
+- Prévia da síntese antes de salvá-la no histórico.
+
+## Arquitetura
+
+| Componente | Responsabilidade |
+| --- | --- |
+| API NestJS | Autenticação, validação, endpoints de documentos e conexão SSE. |
+| PostgreSQL + Prisma | Usuários, metadados e estados dos documentos, sínteses salvas. |
+| MinIO | Arquivos PDF e Markdown extraído. |
+| Redis | Filas de trabalho, Pub/Sub dos eventos, progresso e prévias temporárias. |
+| Worker Python | OCR com `OCR-Extraction` e síntese em streaming via `/v1/chat/completions`. |
+
+O frontend envia o PDF à API, que o registra e enfileira o OCR. O worker processa o documento e publica atualizações no Redis; a API as entrega ao navegador por `GET /documents/:id/events`. Na geração da síntese, o worker encaminha os fragmentos recebidos do modelo sem esperar a resposta completa.
+
+> [!IMPORTANT]
+> A prévia gerada e o texto parcial de uma geração cancelada ficam no Redis por até 30 dias. Eles só passam a integrar o histórico no PostgreSQL quando uma síntese **concluída** é salva com `POST /documents/:id/summaries`. Uma perda dos dados do Redis pode eliminar prévias ainda não salvas.
+
+## Pré-requisitos
+
+- Node.js 20.19+ (20.x), 22.12+ (22.x) ou 24+, com pnpm.
+- Python 3.12 ou superior e [uv](https://docs.astral.sh/uv/).
+- Docker com Docker Compose para PostgreSQL, MinIO e Redis.
+- Um servidor acessível pela URL `OCR_BASE_URL` com API `/v1`, capaz de atender os modelos definidos em `OCR_MODEL` e `SUMMARY_MODEL`.
+- O pacote local `OCR-Extraction`, exigido por `ocr_worker/pyproject.toml`.
+
+> [!NOTE]
+> O worker usa `../../../OCR-Extraction` a partir de `ocr_worker/`. Organize os checkouts de forma que esse caminho exista ou ajuste a fonte local em `ocr_worker/pyproject.toml` antes de executar `uv sync`.
+
+## Início rápido
+
+Execute os comandos na raiz deste repositório:
 
 ```bash
 cp .env.example .env
@@ -10,23 +45,63 @@ pnpm install
 pnpm db:up
 pnpm db:migrate
 pnpm start:dev
-# em outro terminal
+```
+
+Antes de iniciar, edite `.env`: substitua `POSTGRES_PASSWORD`, `MINIO_ROOT_PASSWORD`, `S3_SECRET_KEY` e `JWT_SECRET`; mantenha `DATABASE_URL` e as credenciais `S3_*` alinhadas aos serviços do Compose. Configure `OCR_BASE_URL`, `OCR_MODEL` e `SUMMARY_MODEL` para o servidor de inferência disponível. Se houver frontend em outra origem, ajuste `FRONTEND_ORIGIN`.
+
+Em outro terminal, inicie o worker:
+
+```bash
 UV_CACHE_DIR=ocr_worker/.uv-cache uv sync --project ocr_worker
 pnpm ocr:worker
 ```
 
-Troque `POSTGRES_PASSWORD`, `MINIO_ROOT_PASSWORD`, `S3_SECRET_KEY` e `JWT_SECRET` no `.env` local antes de iniciar. Mantenha `DATABASE_URL` alinhada às credenciais do PostgreSQL e `S3_ACCESS_KEY`/`S3_SECRET_KEY` às do MinIO. O arquivo `.env` contém segredos e não deve entrar no Git; apenas `.env.example` é versionado. `FRONTEND_ORIGIN` é a origem exata do frontend, e `PORT` define a porta da API. O cliente Prisma em `src/generated/prisma/` é gerado por `pnpm db:migrate`, `pnpm build` ou `pnpm start:dev`; não deve entrar no commit.
+A API fica em `http://localhost:3000` e a documentação interativa em **http://localhost:3000/docs**. Por padrão, o Compose expõe PostgreSQL (`5432`), MinIO (`9000` e console `9001`) e Redis (`6379`) apenas em `127.0.0.1`. As portas podem ser alteradas no `.env`.
 
-O Compose publica PostgreSQL, MinIO e Redis apenas em `127.0.0.1`, pois esta configuração é para desenvolvimento local.
+> [!TIP]
+> O worker solicita `return_progress=true` ao llama.cpp para exibir a porcentagem de processamento do prompt. Use uma versão do servidor que aceite esse parâmetro em `/v1/chat/completions`. Para o modelo Ternary Bonsai, a síntese também envia `enable_thinking=false`.
 
-PostgreSQL fica em `localhost:5432`; MinIO usa `localhost:9000` para a API S3 e `localhost:9001` para o console; Redis fica em `localhost:6379`. Ajuste portas e credenciais no `.env`; Compose, backend e worker leem esse arquivo. O worker instala o pacote local `../../OCR-Extraction` (relativo a `backend/`) e usa o servidor compatível com OpenAI definido por `OCR_BASE_URL` (padrão `http://localhost:8081/v1`). A síntese usa `SUMMARY_MODEL` e `/v1/chat/completions` com `stream=true`; os deltas passam pelo Redis Pub/Sub do worker à API e chegam ao SSE autenticado `GET /documents/:id/events`. Redis faz a ponte entre processos; PostgreSQL continua como fonte de verdade dos documentos e das sínteses salvas. Execute uma instância do backend e do worker; antes de escalar, substitua as listas simples por consumer groups do Redis.
+## Fluxo da API
 
-Para `SUMMARY_MODEL` Ternary Bonsai, o worker solicita `enable_thinking=false` na síntese: o modelo começa a emitir o texto visível sem uma longa fase de raciocínio oculto. Outros modelos preservam seu template padrão; se emitirem `reasoning_content`, a interface mostra apenas o estado “Raciocinando…”. O worker também solicita `return_progress=true` ao llama.cpp; enquanto o prompt é processado, repassa `prompt_progress.processed / prompt_progress.total` pelo SSE como `{"kind":"prompt_progress","percent":22}`. A interface mostra a porcentagem até começar a geração do texto. Esse recurso requer uma versão do llama.cpp que aceite `return_progress` em `/v1/chat/completions`. Os logs do worker registram o tempo até o primeiro raciocínio, o primeiro trecho visível e a conclusão, sem registrar o conteúdo.
+Os endpoints de documentos exigem `Authorization: Bearer <token>`. Consulte `/docs` para os corpos e respostas completos.
 
-A documentação interativa da API fica em `http://localhost:3000/docs`.
+| Método | Rota | Uso |
+| --- | --- | --- |
+| `POST` | `/auth/register`, `/auth/login` | Criar conta ou obter token. |
+| `GET` / `POST` | `/auth/me`, `/auth/logout` | Consultar ou encerrar a sessão. |
+| `POST` | `/documents` | Enviar PDF multipart (`file`, `type`: `PUR` ou `RDA`). |
+| `GET` | `/documents`, `/documents/:id` | Listar documentos ou consultar seu estado. |
+| `GET` | `/documents/:id/download`, `/documents/:id/markdown` | Baixar os arquivos. |
+| `POST` | `/documents/:id/generate` | Iniciar a síntese com `topics` obrigatório e `questions` opcional. |
+| `GET` | `/documents/:id/events` | Receber progresso e deltas via SSE. |
+| `POST` | `/documents/:id/cancel` | Solicitar o cancelamento da geração. |
+| `POST` | `/documents/:id/summaries` | Salvar uma síntese concluída no histórico. |
 
-O endpoint `POST /documents` recebe um multipart com o campo `file` (PDF até 20 MB). O arquivo é salvo no MinIO sob uma chave UUID e enfileirado no Redis. O worker converte-o para Markdown e salva `${UUID}.md` no mesmo bucket. Consulte `GET /documents/:id` para os estados `QUEUED`, `EXTRACTING`, `EXTRACTED`, `SUMMARIZING`, `CANCELLING`, `CANCELLED`, `COMPLETED` e `FAILED`; baixe os arquivos por `GET /documents/:id/download` e `GET /documents/:id/markdown`. `POST /documents/:id/generate` enfileira uma síntese que a interface recebe incrementalmente pelo SSE. `POST /documents/:id/cancel` solicita a interrupção de uma síntese enfileirada ou em andamento; o estado passa a `CANCELLING` até o worker fechar o stream de inferência e confirmar `CANCELLED`. O worker verifica o pedido antes da inferência e a cada fragmento recebido; durante o processamento inicial do prompt, a confirmação depende do próximo fragmento ou do timeout do cliente HTTP. O texto parcial já recebido continua na prévia e fica no Redis por até 30 dias para reaparecer após recarregar a página; ele não é tratado como síntese concluída nem pode ser salvo no histórico. O resultado concluído também fica temporariamente no Redis e só é salvo no histórico PostgreSQL quando o usuário escolhe **Salvar síntese** (`POST /documents/:id/summaries`).
+Após iniciar a geração, mantenha a conexão SSE aberta para receber eventos `status`, `prompt_progress`, `reasoning`, `summary_delta` e `error`, quando ocorrerem. O cancelamento passa por `CANCELLING` até o worker confirmar `CANCELLED`; a prévia parcial permanece disponível, mas não pode ser salva como síntese concluída.
 
-As abas PUR e RDA da interface usam esse mesmo fluxo. Cada aba envia o respectivo `type`, mostra apenas os documentos daquele tipo e mantém seus próprios tópicos padrão; streaming, cancelamento, prévia Markdown e histórico funcionam nas duas.
+## Configuração e comandos úteis
 
-Use `pnpm db:deploy` para aplicar migrations existentes fora do desenvolvimento, `pnpm db:studio` para abrir o Prisma Studio e `pnpm db:down` para parar os containers. Os volumes persistem ao parar os serviços; `docker compose down -v` apaga os dados locais.
+O [`.env.example`](./.env.example) documenta todas as variáveis. As principais são:
+
+| Variáveis | Finalidade |
+| --- | --- |
+| `DATABASE_URL`, `POSTGRES_*` | Conexão Prisma e container PostgreSQL. |
+| `S3_*`, `MINIO_*` | Armazenamento de arquivos e portas do MinIO. |
+| `REDIS_URL`, `REDIS_PORT` | Fila, eventos e cache temporário. |
+| `OCR_BASE_URL`, `OCR_API_KEY`, `OCR_MODEL`, `SUMMARY_MODEL` | Servidor de inferência e modelos. |
+| `JWT_SECRET`, `FRONTEND_ORIGIN`, `PORT` | Autenticação, CORS e porta HTTP. |
+| `LOG_LEVEL`, `OBSERVE_APP_KEY`, `OBSERVE_APP_SECRET` | Logs do worker e telemetria opcional. |
+
+```bash
+pnpm lint        # Oxlint
+pnpm test        # testes unitários da API
+pnpm test:e2e    # requer os serviços locais disponíveis
+pnpm build       # gera o cliente Prisma e compila a API
+pnpm db:deploy   # aplica migrations existentes fora do desenvolvimento
+pnpm db:down     # para os containers sem apagar os volumes
+```
+
+Para os testes do worker: `UV_CACHE_DIR=ocr_worker/.uv-cache uv run --project ocr_worker python -m unittest discover -s ocr_worker/tests`.
+
+> [!WARNING]
+> Esta configuração usa uma instância da API e uma do worker. O processamento das filas usa listas Redis simples; revise a estratégia de consumo antes de escalar horizontalmente. Não publique o `.env`, credenciais ou PDFs no Git.
