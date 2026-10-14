@@ -70,7 +70,8 @@ Os endpoints de documentos exigem `Authorization: Bearer <token>`. Consulte `/do
 | `POST` | `/auth/register`, `/auth/login` | Criar conta ou obter token. |
 | `GET` / `POST` | `/auth/me`, `/auth/logout` | Consultar ou encerrar a sessão. |
 | `POST` | `/documents` | Enviar PDF multipart (`file`, `type`: `PUR` ou `RDA`). |
-| `GET` | `/documents`, `/documents/:id` | Listar documentos ou consultar seu estado. |
+| `GET` | `/documents`, `/documents/:id` | Listar metadados dos documentos (`?type=PUR&limit=25&cursor=<id>`) ou consultar um documento com a prévia da síntese. A listagem retorna `items`, `nextCursor` e `total`; `limit` aceita de 1 a 50. |
+| `GET` | `/documents/:id/summaries` | Listar o histórico de sínteses do documento com `limit` e `cursor`. |
 | `GET` | `/documents/:id/download`, `/documents/:id/markdown` | Baixar os arquivos. |
 | `POST` | `/documents/:id/generate` | Iniciar a síntese com `topics` obrigatório e `questions` opcional. |
 | `GET` | `/documents/:id/events` | Receber progresso e deltas via SSE. |
@@ -94,14 +95,10 @@ O [`.env.example`](./.env.example) documenta todas as variáveis. As principais 
 
 ```bash
 pnpm lint        # Oxlint
-pnpm test        # testes unitários da API
-pnpm test:e2e    # requer os serviços locais disponíveis
 pnpm build       # gera o cliente Prisma e compila a API
 pnpm db:deploy   # aplica migrations existentes fora do desenvolvimento
 pnpm db:down     # para os containers sem apagar os volumes
 ```
-
-Para os testes do worker: `UV_CACHE_DIR=ocr_worker/.uv-cache uv run --project ocr_worker python -m unittest discover -s ocr_worker/tests`.
 
 > [!WARNING]
 > Esta configuração usa uma instância da API e uma do worker. O processamento das filas usa listas Redis simples; revise a estratégia de consumo antes de escalar horizontalmente. Não publique o `.env`, credenciais ou PDFs no Git.
