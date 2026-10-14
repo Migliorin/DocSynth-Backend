@@ -6,7 +6,6 @@
 /ocr_worker/.uv-cache
 /ocr_worker/node_modules/
 __pycache__/
-.pytest_cache/
 *.py[cod]
 /:memory:.ses
 /build
@@ -25,10 +24,6 @@ lerna-debug.log*
 
 # OS
 .DS_Store
-
-# Tests
-/coverage
-/.nyc_output
 
 # IDEs and editors
 /.idea
