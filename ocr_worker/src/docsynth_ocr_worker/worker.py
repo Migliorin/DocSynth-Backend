@@ -66,6 +66,9 @@ def main() -> None:
         try:
             job = json.loads(raw)
             document_id = str(UUID(job["documentId"]))
+            job_id = job.get("jobId")
+            if job_id is not None:
+                job_id = str(UUID(job_id))
             object_key = job["objectKey"]
             if not isinstance(object_key, str) or not object_key:
                 raise ValueError("Invalid object key")
@@ -93,19 +96,20 @@ def main() -> None:
 
         logger.info("Processing document %s", document_id)
         action = job["action"]
-        cancel_key = f"docsynth:ocr:cancel:{document_id}"
+        job_key = f"{document_id}:{job_id}" if job_id else document_id
+        cancel_key = f"docsynth:ocr:cancel:{job_key}"
         if action == "SUMMARIZE":
-            queue.delete(f"docsynth:ocr:summary:{document_id}")
+            queue.delete(f"docsynth:ocr:summary:{job_key}")
         markdown_key = job.get("markdownKey")
         try:
             if action == "SUMMARIZE" and queue.exists(cancel_key):
                 raise GenerationCancelled()
             working_status = "EXTRACTING" if action == "EXTRACT" else "SUMMARIZING"
-            publish_event(queue, document_id, {"kind": "status", "status": working_status})
-            queue.lpush(RESULTS, json.dumps({"documentId": document_id, "status": working_status}))
+            publish_event(queue, document_id, {"kind": "status", "status": working_status}, job_id)
+            queue.lpush(RESULTS, json.dumps({"documentId": document_id, "jobId": job_id, "status": working_status}))
 
             def report_progress(message: str) -> None:
-                publish_event(queue, document_id, {"kind": "progress", "message": message})
+                publish_event(queue, document_id, {"kind": "progress", "message": message}, job_id)
 
             markdown_key, markdown = load_or_extract_markdown(job, bucket, storage, client, report_progress)
             if action == "EXTRACT":
@@ -122,17 +126,17 @@ def main() -> None:
                         event["delta"] = value
                     elif kind == "prompt_progress":
                         event["percent"] = value
-                    publish_event(queue, document_id, event)
+                    publish_event(queue, document_id, event, job_id)
 
                 summary = generate_summary(markdown, job, client, summary_model, report_summary, lambda: bool(queue.exists(cancel_key)))
                 if queue.exists(cancel_key):
                     raise GenerationCancelled()
                 result = {"documentId": document_id, "status": "COMPLETED", "markdownKey": markdown_key, "summary": summary}
-            publish_event(queue, document_id, {"kind": "status", "status": result["status"]})
+            publish_event(queue, document_id, {"kind": "status", "status": result["status"]}, job_id)
         except GenerationCancelled:
             logger.info("Summary cancelled for %s", document_id)
             result = {"documentId": document_id, "status": "CANCELLED"}
-            publish_event(queue, document_id, {"kind": "status", "status": "CANCELLED"})
+            publish_event(queue, document_id, {"kind": "status", "status": "CANCELLED"}, job_id)
         except Exception as error:
             logger.exception("OCR failed for document %s", document_id)
             result = {
@@ -142,8 +146,9 @@ def main() -> None:
             }
             if markdown_key:
                 result["markdownKey"] = markdown_key
-            publish_event(queue, document_id, {"kind": "error", "status": "FAILED", "message": result["error"]})
+            publish_event(queue, document_id, {"kind": "error", "status": "FAILED", "message": result["error"]}, job_id)
 
+        result["jobId"] = job_id
         with queue.pipeline() as pipe:
             pipe.lpush(RESULTS, json.dumps(result))
             pipe.lrem(JOBS_PROCESSING, 1, raw)
@@ -152,16 +157,17 @@ def main() -> None:
             pipe.execute()
 
 
-def publish_event(queue, document_id: str, event: dict) -> None:
-    sequence = queue.incr(f"docsynth:ocr:sequence:{document_id}")
-    queue.expire(f"docsynth:ocr:sequence:{document_id}", PROGRESS_TTL)
-    payload = json.dumps({"documentId": document_id, "sequence": sequence, **event}, ensure_ascii=False)
+def publish_event(queue, document_id: str, event: dict, job_id: str | None = None) -> None:
+    job_key = f"{document_id}:{job_id}" if job_id else document_id
+    sequence = queue.incr(f"docsynth:ocr:sequence:{job_key}")
+    queue.expire(f"docsynth:ocr:sequence:{job_key}", PROGRESS_TTL)
+    payload = json.dumps({"documentId": document_id, "jobId": job_id, "sequence": sequence, **event}, ensure_ascii=False)
     if event.get("kind") == "summary_delta":
-        queue.append(f"docsynth:ocr:summary:{document_id}", event["delta"])
-        queue.expire(f"docsynth:ocr:summary:{document_id}", SUMMARY_TTL)
+        queue.append(f"docsynth:ocr:summary:{job_key}", event["delta"])
+        queue.expire(f"docsynth:ocr:summary:{job_key}", SUMMARY_TTL)
     ttl = SUMMARY_TTL if event.get("status") in {"COMPLETED", "CANCELLED"} else PROGRESS_TTL
-    queue.set(f"docsynth:ocr:progress:{document_id}", payload, ex=ttl)
-    queue.publish(f"docsynth:ocr:events:{document_id}", payload)
+    queue.set(f"docsynth:ocr:progress:{job_key}", payload, ex=ttl)
+    queue.publish(f"docsynth:ocr:events:{job_key}", payload)
 
 
 class ProgressOutput:

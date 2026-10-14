@@ -7,9 +7,11 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { Response } from 'express';
+import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { StorageService } from '../storage/storage.service.js';
 import { OcrQueueService } from './ocr-queue.service.js';
+import type { DocumentType } from '../generated/prisma/enums.js';
 
 @Injectable()
 export class DocumentsService {
@@ -40,7 +42,9 @@ export class DocumentsService {
     }
 
     const id = randomUUID();
+    const jobId = randomUUID();
     const objectKey = `${userId}/${id}.pdf`;
+    const statusId = await this.statusId('QUEUED');
     await this.storage.upload(objectKey, file.buffer);
     const document = await this.prisma.document
       .create({
@@ -52,10 +56,12 @@ export class DocumentsService {
           description,
           mimeType: 'application/pdf',
           size: file.size,
+          jobId,
           type,
           userId,
-          ocrStatus: 'QUEUED',
+          ocrStatusId: statusId,
         },
+        include: { status: true },
       })
       .catch(async (error) => {
         // ponytail: S3 + PostgreSQL não compartilham transação; adicione limpeza de órfãos se quedas durante upload forem relevantes.
@@ -67,6 +73,7 @@ export class DocumentsService {
       await this.ocrQueue.enqueue({
         action: 'EXTRACT',
         documentId: id,
+        jobId,
         objectKey,
         markdownKey: null,
         type,
@@ -74,51 +81,134 @@ export class DocumentsService {
     } catch (error) {
       await this.prisma.document.update({
         where: { id },
-        data: { ocrStatus: 'FAILED', ocrError: 'Could not enqueue OCR job' },
+        data: {
+          ocrStatusId: await this.statusId('FAILED'),
+          ocrError: 'Could not enqueue OCR job',
+        },
       });
       throw new ServiceUnavailableException('Serviço de OCR indisponível.', {
         cause: error,
       });
     }
 
-    return document;
+    return this.presentStatus(document);
   }
 
-  async findAll(userId: string) {
+  async findAll(userId: string, query: { type?: unknown; cursor?: unknown; limit?: unknown; search?: unknown }) {
+    const type = query.type as DocumentType | undefined;
+    if (type !== undefined && type !== 'PUR' && type !== 'RDA')
+      throw new BadRequestException('O tipo do documento deve ser PUR ou RDA.');
+    const limit = query.limit === undefined ? 25 : Number(query.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50)
+      throw new BadRequestException('O limite deve ser um número entre 1 e 50.');
+    if (query.search !== undefined && (typeof query.search !== 'string' || query.search.length > 120))
+      throw new BadRequestException('A busca deve ter até 120 caracteres.');
+    const search = typeof query.search === 'string' ? query.search.trim() : '';
+    const where = {
+      userId,
+      ...(type ? { type } : {}),
+      ...(search ? {
+        OR: [
+          { title: { contains: search, mode: 'insensitive' as const } },
+          { originalName: { contains: search, mode: 'insensitive' as const } },
+          { description: { contains: search, mode: 'insensitive' as const } },
+        ],
+      } : {}),
+    };
+    let cursor: string | undefined;
+    if (query.cursor !== undefined) {
+      if (typeof query.cursor !== 'string' || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(query.cursor))
+        throw new BadRequestException('Cursor inválido.');
+      const found = await this.prisma.document.findFirst({
+        where: { id: query.cursor, ...where },
+        select: { id: true },
+      });
+      if (!found) throw new BadRequestException('Cursor inválido.');
+      cursor = found.id;
+    }
     const documents = await this.prisma.document.findMany({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-      include: { summaries: { orderBy: { createdAt: 'desc' } } },
+      where,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      take: limit + 1,
+      include: { status: true },
     });
-    return Promise.all(
-      documents.map(async (document) => ({
-        ...document,
-        generatedSummary:
-          ['COMPLETED', 'CANCELLED'].includes(document.ocrStatus)
-            ? await this.ocrQueue.generatedSummary(document.id)
-            : null,
-      })),
-    );
+    const hasMore = documents.length > limit;
+    if (hasMore) documents.pop();
+    const nextCursor = hasMore ? documents.at(-1)?.id ?? null : null;
+    const items = documents.map((document) => this.presentStatus(document));
+    return { items, nextCursor, total: await this.prisma.document.count({ where }) };
+  }
+
+  async findDetails(id: string, userId: string) {
+    const document = await this.findOne(id, userId);
+    return {
+      ...document,
+      generatedSummary: ['COMPLETED', 'CANCELLED'].includes(document.ocrStatus)
+        ? await this.ocrQueue.generatedSummary(id, document.jobId)
+        : null,
+    };
+  }
+
+  async listSummaries(id: string, userId: string, query: { limit?: unknown; cursor?: unknown }) {
+    await this.findOne(id, userId);
+    const limit = query.limit === undefined ? 20 : Number(query.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50)
+      throw new BadRequestException('O limite deve ser um número entre 1 e 50.');
+    let cursor: string | undefined;
+    if (query.cursor !== undefined) {
+      if (typeof query.cursor !== 'string' || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(query.cursor))
+        throw new BadRequestException('Cursor inválido.');
+      const found = await this.prisma.documentSummary.findFirst({
+        where: { id: query.cursor, documentId: id },
+        select: { id: true },
+      });
+      if (!found) throw new BadRequestException('Cursor inválido.');
+      cursor = found.id;
+    }
+    const summaries = await this.prisma.documentSummary.findMany({
+      where: { documentId: id },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      take: limit + 1,
+    });
+    const hasMore = summaries.length > limit;
+    if (hasMore) summaries.pop();
+    return {
+      items: summaries,
+      nextCursor: hasMore ? summaries.at(-1)?.id ?? null : null,
+      total: await this.prisma.documentSummary.count({ where: { documentId: id } }),
+    };
   }
 
   async saveSummary(id: string, userId: string) {
     const document = await this.findOne(id, userId);
     if (document.ocrStatus !== 'COMPLETED')
       throw new ConflictException('A síntese ainda não foi concluída.');
-    const content = await this.ocrQueue.generatedSummary(id);
-    if (!content?.trim())
+    const generationId = document.jobId ?? document.id;
+    const content = await this.ocrQueue.generatedSummary(id, document.jobId);
+    if (!content?.trim()) {
+      const saved = await this.prisma.documentSummary.findUnique({
+        where: { documentId_generationId: { documentId: id, generationId } },
+      });
+      if (saved) return saved;
       throw new ConflictException('Não há uma síntese concluída para salvar.');
+    }
 
     const summary = await this.prisma.documentSummary.create({
       data: {
-        documentId: id,
-        content,
-        topics: document.topics,
-        questions: document.questions,
+        documentId: id, generationId, content,
+        topics: document.topics, questions: document.questions,
         summaryLevel: document.summaryLevel,
       },
+    }).catch(async (error: unknown) => {
+      if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002')
+        throw error;
+      return this.prisma.documentSummary.findUniqueOrThrow({
+        where: { documentId_generationId: { documentId: id, generationId } },
+      });
     });
-    await this.ocrQueue.clearGeneratedSummary(id);
+    await this.ocrQueue.clearGeneratedSummary(id, document.jobId);
     return summary;
   }
 
@@ -145,21 +235,35 @@ export class DocumentsService {
     if (!['concise', 'balanced', 'deep'].includes(String(summaryLevel)))
       throw new BadRequestException('Nível de síntese inválido.');
 
-    const update = await this.prisma.document.update({
-      where: { id },
+    const [activeStatusIds, queuedStatusId] = await Promise.all([
+      this.statusIds(['QUEUED', 'EXTRACTING', 'SUMMARIZING', 'CANCELLING']),
+      this.statusId('QUEUED'),
+    ]);
+    const jobId = randomUUID();
+    const { count } = await this.prisma.document.updateMany({
+      where: {
+        id,
+        userId,
+        ocrStatusId: { notIn: activeStatusIds },
+      },
       data: {
         topics,
         questions,
         summaryLevel: String(summaryLevel),
-        ocrStatus: 'QUEUED',
+        jobId,
+        ocrStatusId: queuedStatusId,
         ocrError: null,
       },
     });
+    if (!count)
+      throw new ConflictException(
+        'A geração deste documento já está em andamento.',
+      );
     try {
-      await this.ocrQueue.clearCancellation(id);
       await this.ocrQueue.enqueue({
         action: 'SUMMARIZE',
         documentId: id,
+        jobId,
         objectKey: document.objectKey,
         markdownKey: document.markdownKey,
         type: document.type,
@@ -172,7 +276,7 @@ export class DocumentsService {
       await this.prisma.document.update({
         where: { id },
         data: {
-          ocrStatus: 'FAILED',
+          ocrStatusId: await this.statusId('FAILED'),
           ocrError: 'Could not enqueue summary job',
         },
       });
@@ -181,7 +285,15 @@ export class DocumentsService {
         { cause: error },
       );
     }
-    return update;
+    return {
+      ...document,
+      topics,
+      questions,
+      summaryLevel: String(summaryLevel),
+      jobId,
+      ocrStatus: 'QUEUED',
+      ocrError: null,
+    };
   }
 
   async cancelGeneration(id: string, userId: string) {
@@ -190,13 +302,17 @@ export class DocumentsService {
       throw new ConflictException('Não há uma síntese em geração para interromper.');
 
     try {
-      await this.ocrQueue.requestCancellation(id);
+      await this.ocrQueue.requestCancellation(id, document.jobId);
     } catch (error) {
       throw new ServiceUnavailableException('Não foi possível interromper a geração.', { cause: error });
     }
+    const [cancellableStatusIds, cancellingStatusId] = await Promise.all([
+      this.statusIds(['QUEUED', 'SUMMARIZING']),
+      this.statusId('CANCELLING'),
+    ]);
     const { count } = await this.prisma.document.updateMany({
-      where: { id, userId, ocrStatus: { in: ['QUEUED', 'SUMMARIZING'] } },
-      data: { ocrStatus: 'CANCELLING' },
+      where: { id, userId, ocrStatusId: { in: cancellableStatusIds } },
+      data: { ocrStatusId: cancellingStatusId },
     });
     if (!count) {
       if ((await this.findOne(id, userId)).ocrStatus === 'CANCELLED')
@@ -215,9 +331,10 @@ export class DocumentsService {
   async findOne(id: string, userId: string) {
     const document = await this.prisma.document.findFirst({
       where: { id, userId },
+      include: { status: true },
     });
     if (!document) throw new NotFoundException('Documento não encontrado');
-    return document;
+    return this.presentStatus(document);
   }
 
   async downloadMarkdown(id: string, userId: string) {
@@ -232,7 +349,7 @@ export class DocumentsService {
 
   async streamEvents(id: string, userId: string, response: Response) {
     const document = await this.findOne(id, userId);
-    return this.ocrQueue.stream(id, document.ocrStatus, response);
+    return this.ocrQueue.stream(id, document.jobId, document.ocrStatus, response);
   }
 
   private cleanList(
@@ -262,5 +379,29 @@ export class DocumentsService {
     if (typeof value !== 'string' || value.length > maxLength)
       throw new BadRequestException(`Campo ${field} inválido.`);
     return value.trim() || null;
+  }
+
+  private async statusId(code: string) {
+    const status = await this.prisma.documentStatus.findUnique({
+      where: { code },
+      select: { id: true },
+    });
+    if (!status) throw new Error(`Document status ${code} is missing`);
+    return status.id;
+  }
+
+  private async statusIds(codes: string[]) {
+    const statuses = await this.prisma.documentStatus.findMany({
+      where: { code: { in: codes } },
+      select: { id: true },
+    });
+    if (statuses.length !== codes.length)
+      throw new Error('A document status is missing');
+    return statuses.map(({ id }) => id);
+  }
+
+  private presentStatus<T extends { status: { code: string }; ocrStatusId: number }>(document: T) {
+    const { status, ocrStatusId: _statusId, ...fields } = document;
+    return { ...fields, ocrStatus: status.code };
   }
 }

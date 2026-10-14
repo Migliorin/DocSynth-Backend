@@ -22,44 +22,56 @@ enum DocumentType {
 }
 
 model User {
-  id           String   @id @default(uuid()) @db.Uuid
+  id           String     @id @default(uuid()) @db.Uuid
   name         String
-  email        String   @unique
-  passwordHash String   @map("password_hash")
-  role         UserRole @default(USER)
-  createdAt    DateTime @default(now()) @map("created_at")
+  email        String     @unique
+  passwordHash String     @map("password_hash")
+  role         UserRole   @default(USER)
+  createdAt    DateTime   @default(now()) @map("created_at")
   documents    Document[]
+  refreshTokenHash String? @map("refresh_token_hash")
 
   @@map("users")
 }
 
 model Document {
-  id           String   @id @default(uuid()) @db.Uuid
-  objectKey    String   @unique @map("object_key")
-  originalName String   @map("original_name")
+  id           String            @id @default(uuid()) @db.Uuid
+  objectKey    String            @unique @map("object_key")
+  originalName String            @map("original_name")
   title        String?
-  description  String?  @db.Text
-  mimeType     String   @map("mime_type")
+  description  String?           @db.Text
+  mimeType     String            @map("mime_type")
   size         Int
-  ocrStatus    String   @default("QUEUED") @map("ocr_status")
-  markdownKey  String?  @map("markdown_key")
-  ocrError     String?  @db.Text @map("ocr_error")
-  type         DocumentType @default(PUR) @map("document_type")
-  userId       String?  @db.Uuid @map("user_id")
-  user         User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
-  topics       String[] @default([])
-  questions    String[] @default([])
-  summaryLevel String   @default("balanced") @map("summary_level")
+  jobId        String?           @map("job_id") @db.Uuid
+  ocrStatusId  Int               @map("ocr_status_id")
+  status       DocumentStatus    @relation(fields: [ocrStatusId], references: [id], onUpdate: Cascade)
+  markdownKey  String?           @map("markdown_key")
+  ocrError     String?           @map("ocr_error") @db.Text
+  type         DocumentType      @default(PUR) @map("document_type")
+  userId       String?           @map("user_id") @db.Uuid
+  user         User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+  topics       String[]          @default([])
+  questions    String[]          @default([])
+  summaryLevel String            @default("balanced") @map("summary_level")
   summaries    DocumentSummary[]
-  createdAt    DateTime @default(now()) @map("created_at")
+  createdAt    DateTime          @default(now()) @map("created_at")
 
   @@index([userId, type])
   @@map("documents")
 }
 
+model DocumentStatus {
+  id        Int        @id @default(autoincrement())
+  code      String     @unique
+  documents Document[]
+
+  @@map("document_statuses")
+}
+
 model DocumentSummary {
   id           String   @id @default(uuid()) @db.Uuid
-  documentId   String   @db.Uuid @map("document_id")
+  documentId   String   @map("document_id") @db.Uuid
+  generationId String   @map("generation_id") @db.Uuid
   document     Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
   content      String   @db.Text
   topics       String[] @default([])
@@ -68,5 +80,6 @@ model DocumentSummary {
   createdAt    DateTime @default(now()) @map("created_at")
 
   @@index([documentId, createdAt])
+  @@unique([documentId, generationId])
   @@map("document_summaries")
 }

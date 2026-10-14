@@ -11,9 +11,11 @@ import { PrismaService } from '../prisma/prisma.service.js';
 const JOBS = 'docsynth:ocr:jobs';
 const RESULTS = 'docsynth:ocr:results';
 const RESULTS_PROCESSING = 'docsynth:ocr:results:processing';
+const jobKey = (documentId: string, jobId?: string | null) => jobId ? `${documentId}:${jobId}` : documentId;
 
 type OcrResult = {
   documentId: string;
+  jobId?: string | null;
   status: 'EXTRACTING' | 'EXTRACTED' | 'SUMMARIZING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
   markdownKey?: string;
   summary?: string;
@@ -23,6 +25,7 @@ type OcrResult = {
 type OcrJob = {
   action: 'EXTRACT' | 'SUMMARIZE';
   documentId: string;
+  jobId: string;
   objectKey: string;
   markdownKey: string | null;
   type: 'PUR' | 'RDA';
@@ -62,13 +65,14 @@ export class OcrQueueService implements OnModuleInit, OnModuleDestroy {
   }
 
   async enqueue(job: OcrJob): Promise<void> {
+    const key = jobKey(job.documentId, job.jobId);
     if (job.action === 'SUMMARIZE')
       await this.producer
         .multi()
-        .del(`docsynth:ocr:summary:${job.documentId}`)
+        .del(`docsynth:ocr:summary:${key}`)
         .set(
-          `docsynth:ocr:progress:${job.documentId}`,
-          JSON.stringify({ documentId: job.documentId, kind: 'status', status: 'QUEUED' }),
+          `docsynth:ocr:progress:${key}`,
+          JSON.stringify({ documentId: job.documentId, jobId: job.jobId, kind: 'status', status: 'QUEUED' }),
           { EX: 3600 },
         )
         .lPush(JOBS, JSON.stringify(job))
@@ -76,29 +80,27 @@ export class OcrQueueService implements OnModuleInit, OnModuleDestroy {
     else await this.producer.lPush(JOBS, JSON.stringify(job));
   }
 
-  requestCancellation(documentId: string) {
+  requestCancellation(documentId: string, jobId: string | null) {
     // shortcut: keep the flag until the worker reaches the job; add expiry when queued jobs have a maximum age.
-    return this.producer.set(`docsynth:ocr:cancel:${documentId}`, '1');
+    return this.producer.set(`docsynth:ocr:cancel:${jobKey(documentId, jobId)}`, '1');
   }
 
-  clearCancellation(documentId: string) {
-    return this.producer.del(`docsynth:ocr:cancel:${documentId}`);
-  }
-
-  async generatedSummary(documentId: string) {
-    const progress = await this.producer.get(`docsynth:ocr:progress:${documentId}`);
+  async generatedSummary(documentId: string, jobId: string | null) {
+    const key = jobKey(documentId, jobId);
+    const progress = await this.producer.get(`docsynth:ocr:progress:${key}`);
     if (!progress || !['COMPLETED', 'CANCELLED'].includes((JSON.parse(progress) as { status?: string }).status ?? ''))
       return null;
-    return this.producer.get(`docsynth:ocr:summary:${documentId}`);
+    return this.producer.get(`docsynth:ocr:summary:${key}`);
   }
 
-  clearGeneratedSummary(documentId: string) {
-    return this.producer.del(`docsynth:ocr:summary:${documentId}`);
+  clearGeneratedSummary(documentId: string, jobId: string | null) {
+    return this.producer.del(`docsynth:ocr:summary:${jobKey(documentId, jobId)}`);
   }
 
-  async stream(documentId: string, initialStatus: string, response: Response) {
+  async stream(documentId: string, jobId: string | null, initialStatus: string, response: Response) {
     const subscriber = this.producer.duplicate();
-    const channel = `docsynth:ocr:events:${documentId}`;
+    const key = jobKey(documentId, jobId);
+    const channel = `docsynth:ocr:events:${key}`;
     let lastSequence = 0;
     let closed = false;
     const send = (raw: string, snapshot = false) => {
@@ -112,7 +114,7 @@ export class OcrQueueService implements OnModuleInit, OnModuleDestroy {
         if (event.sequence) lastSequence = event.sequence;
         if (snapshot && event.kind === 'summary_delta') {
           void this.producer
-            .get(`docsynth:ocr:summary:${documentId}`)
+            .get(`docsynth:ocr:summary:${key}`)
             .then((summary) => {
               if (!closed)
                 response.write(`data: ${JSON.stringify({ ...event, kind: 'summary_snapshot', summary })}\n\n`);
@@ -142,7 +144,7 @@ export class OcrQueueService implements OnModuleInit, OnModuleDestroy {
       void subscriber.unsubscribe(channel).finally(() => subscriber.disconnect());
     });
 
-    const latest = await this.producer.get(`docsynth:ocr:progress:${documentId}`);
+    const latest = await this.producer.get(`docsynth:ocr:progress:${key}`);
     if (latest) send(latest, true);
     else {
       response.write(`data: ${JSON.stringify({ kind: 'status', status: initialStatus })}\n\n`);
@@ -204,9 +206,8 @@ export class OcrQueueService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-        result.documentId,
-      ) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(result.documentId) ||
+      (result.jobId != null && !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(result.jobId)) ||
       !['EXTRACTING', 'EXTRACTED', 'SUMMARIZING', 'COMPLETED', 'FAILED', 'CANCELLED'].includes(result.status)
     ) {
       this.logger.error('Ignoring invalid OCR result from Redis');
@@ -223,25 +224,33 @@ export class OcrQueueService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const data: {
-      ocrStatus: string;
-      markdownKey?: string;
-      ocrError?: string | null;
-    } =
+    const status = await this.prisma.documentStatus.findUnique({
+      where: { code: result.status },
+      select: { id: true },
+    });
+    if (!status) throw new Error(`Document status ${result.status} is missing`);
+    const cancelledStatusIds = result.status === 'SUMMARIZING'
+      ? (await this.prisma.documentStatus.findMany({
+          where: { code: { in: ['CANCELLING', 'CANCELLED'] } },
+          select: { id: true },
+        })).map(({ id }) => id)
+      : [];
+
+    const data =
       result.status === 'COMPLETED' || result.status === 'EXTRACTED'
         ? {
-            ocrStatus: result.status,
+            ocrStatusId: status.id,
             markdownKey: result.markdownKey,
             ocrError: null,
           }
         : result.status === 'FAILED'
           ? {
-              ocrStatus: result.status,
+              ocrStatusId: status.id,
               markdownKey: result.markdownKey,
               ocrError: result.error ?? 'OCR failed',
             }
           : {
-              ocrStatus: result.status,
+              ocrStatusId: status.id,
               markdownKey: result.markdownKey,
               ocrError: null,
             };
@@ -249,15 +258,17 @@ export class OcrQueueService implements OnModuleInit, OnModuleDestroy {
     const { count } = await this.prisma.document.updateMany({
       where: {
         id: result.documentId,
+        // Jobs enfileirados antes desta versão não têm jobId.
+        jobId: result.jobId ?? null,
         ...(result.status === 'SUMMARIZING'
-          ? { ocrStatus: { notIn: ['CANCELLING', 'CANCELLED'] } }
+          ? { ocrStatusId: { notIn: cancelledStatusIds } }
           : {}),
       },
       data,
     });
     if (!count)
       this.logger.warn(
-        `Discarding OCR result for missing document ${result.documentId}`,
+        `Discarding OCR result for missing or stale document job ${result.documentId}`,
       );
   }
 }

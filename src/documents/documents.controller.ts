@@ -10,16 +10,20 @@ import {
   UseInterceptors,
   UseGuards,
   Req,
+  Query,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import {
   ApiBody,
   ApiBearerAuth,
   ApiConsumes,
+  ApiCreatedResponse,
+  ApiOkResponse,
   ApiParam,
   ApiOperation,
   ApiProduces,
   ApiResponse,
+  ApiQuery,
   ApiTags,
 } from '@nestjs/swagger';
 import type { Response } from 'express';
@@ -30,6 +34,15 @@ import { DocumentsService } from './documents.service.js';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard.js';
 import { Roles, RolesGuard } from '../auth/roles.guard.js';
 import type { TokenPayload } from '../auth/auth.service.js';
+import { GenerateDocumentDto, ListDocumentsQueryDto, ListSummariesQueryDto, UploadDocumentDto } from './dtos/documents-request.dto.js';
+import {
+  CancelGenerationResponseDto,
+  DocumentDetailsResponseDto,
+  DocumentResponseDto,
+  ListDocumentsResponseDto,
+  ListSummariesResponseDto,
+  SummaryResponseDto,
+} from './dtos/documents-response.dto.js';
 
 @Controller('documents')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -41,8 +54,26 @@ export class DocumentsController {
 
   @Get()
   @ApiOperation({ summary: 'Listar documentos do usuário autenticado' })
-  findAll(@Req() request: Request & { user: TokenPayload }) {
-    return this.documents.findAll(request.user.sub);
+  @ApiQuery({ name: 'type', required: false, enum: ['PUR', 'RDA'] })
+  @ApiQuery({ name: 'search', required: false, description: 'Busca por título, nome ou descrição do documento.' })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    minimum: 1,
+    maximum: 50,
+  })
+  @ApiQuery({
+    name: 'cursor',
+    required: false,
+    description: 'ID do último documento da página anterior.',
+  })
+  @ApiOkResponse({ type: ListDocumentsResponseDto })
+  findAll(
+    @Req() request: Request & { user: TokenPayload },
+    @Query() query: ListDocumentsQueryDto,
+  ): Promise<ListDocumentsResponseDto> {
+    return this.documents.findAll(request.user.sub, query);
   }
 
   @Post()
@@ -51,7 +82,7 @@ export class DocumentsController {
   @ApiBody({
     schema: {
       type: 'object',
-      required: ['file'],
+      required: ['file', 'type'],
       properties: {
         file: { type: 'string', format: 'binary' },
         type: { type: 'string', enum: ['PUR', 'RDA'] },
@@ -60,32 +91,16 @@ export class DocumentsController {
       },
     },
   })
-  @ApiResponse({
-    status: 201,
-    description: 'PDF salvo no MinIO e registrado.',
-    schema: {
-      type: 'object',
-      properties: {
-        id: { type: 'string', format: 'uuid' },
-        objectKey: { type: 'string', example: '{userId}/{documentId}.pdf' },
-        originalName: { type: 'string' },
-        mimeType: { type: 'string', example: 'application/pdf' },
-        size: { type: 'integer' },
-        ocrStatus: { type: 'string', example: 'QUEUED' },
-        markdownKey: { type: 'string', nullable: true },
-        createdAt: { type: 'string', format: 'date-time' },
-      },
-    },
-  })
+  @ApiCreatedResponse({ type: DocumentResponseDto, description: 'PDF salvo no MinIO e registrado.' })
   @ApiResponse({ status: 400, description: 'Arquivo ausente ou PDF inválido.' })
   @UseInterceptors(
     FileInterceptor('file', { limits: { fileSize: 20 * 1024 * 1024 } }),
   )
   upload(
     @UploadedFile() file: Express.Multer.File | undefined,
-    @Body() body: { type?: unknown; title?: unknown; description?: unknown },
+    @Body() body: UploadDocumentDto,
     @Req() request: Request & { user: TokenPayload },
-  ) {
+  ): Promise<DocumentResponseDto> {
     return this.documents.upload(file, body, request.user.sub);
   }
 
@@ -94,32 +109,34 @@ export class DocumentsController {
     summary: 'Gerar síntese do documento com tópicos informados',
   })
   @ApiParam({ name: 'id', format: 'uuid' })
+  @ApiCreatedResponse({ type: DocumentResponseDto })
   generate(
     @Param('id', new ParseUUIDPipe()) id: string,
-    @Body()
-    body: { topics?: unknown; questions?: unknown; summaryLevel?: unknown },
+    @Body() body: GenerateDocumentDto,
     @Req() request: Request & { user: TokenPayload },
-  ) {
+  ): Promise<DocumentResponseDto> {
     return this.documents.generate(id, request.user.sub, body ?? {});
   }
 
   @Post(':id/cancel')
   @ApiOperation({ summary: 'Parar a geração da síntese do documento' })
   @ApiParam({ name: 'id', format: 'uuid' })
+  @ApiCreatedResponse({ type: CancelGenerationResponseDto })
   cancelGeneration(
     @Param('id', new ParseUUIDPipe()) id: string,
     @Req() request: Request & { user: TokenPayload },
-  ) {
+  ): Promise<CancelGenerationResponseDto> {
     return this.documents.cancelGeneration(id, request.user.sub);
   }
 
   @Post(':id/summaries')
   @ApiOperation({ summary: 'Salvar a síntese concluída no histórico' })
   @ApiParam({ name: 'id', format: 'uuid' })
+  @ApiCreatedResponse({ type: SummaryResponseDto })
   saveSummary(
     @Param('id', new ParseUUIDPipe()) id: string,
     @Req() request: Request & { user: TokenPayload },
-  ) {
+  ): Promise<SummaryResponseDto> {
     return this.documents.saveSummary(id, request.user.sub);
   }
 
@@ -156,12 +173,26 @@ export class DocumentsController {
   @Get(':id')
   @ApiOperation({ summary: 'Consultar status da extração OCR' })
   @ApiParam({ name: 'id', format: 'uuid' })
-  @ApiResponse({ status: 200, description: 'Documento e status da extração.' })
+  @ApiOkResponse({ type: DocumentDetailsResponseDto, description: 'Documento, status e prévia da síntese.' })
   getOne(
     @Param('id', new ParseUUIDPipe()) id: string,
     @Req() request: Request & { user: TokenPayload },
-  ) {
-    return this.documents.findOne(id, request.user.sub);
+  ): Promise<DocumentDetailsResponseDto> {
+    return this.documents.findDetails(id, request.user.sub);
+  }
+
+  @Get(':id/summaries')
+  @ApiOperation({ summary: 'Listar sínteses salvas do documento' })
+  @ApiParam({ name: 'id', format: 'uuid' })
+  @ApiQuery({ name: 'limit', required: false, type: Number, minimum: 1, maximum: 50 })
+  @ApiQuery({ name: 'cursor', required: false, description: 'ID da última síntese da página anterior.' })
+  @ApiOkResponse({ type: ListSummariesResponseDto })
+  listSummaries(
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Req() request: Request & { user: TokenPayload },
+    @Query() query: ListSummariesQueryDto,
+  ): Promise<ListSummariesResponseDto> {
+    return this.documents.listSummaries(id, request.user.sub, query);
   }
 
   @Get(':id/events')
